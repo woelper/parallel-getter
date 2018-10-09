@@ -38,6 +38,11 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
         }
     }
 
+    pub fn client(mut self, client: Arc<Client>) -> Self {
+        self.client = Some(client);
+        self
+    }
+
     pub fn length(mut self, length: u64) -> Self {
         self.length = Some(length);
         self
