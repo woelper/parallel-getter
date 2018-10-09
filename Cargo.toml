@@ -1,0 +1,10 @@
+[package]
+name = "parallel-getter"
+version = "0.1.0"
+authors = ["Michael Aaron Murphy <mmstickman@gmail.com>"]
+license = "MIT"
+
+[dependencies]
+progress-streams = { git = "https://github.com/pop-os/progress-streams" }
+reqwest = "0.9.2"
+tempfile = "3.0.4"
