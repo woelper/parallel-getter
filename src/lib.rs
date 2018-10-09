@@ -10,6 +10,7 @@ use reqwest::{Client, header::{
 use std::thread::{self, JoinHandle};
 use std::fs::{self, File};
 use std::io::{self, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -22,6 +23,12 @@ pub struct ParallelGetter<'a, W: Write + 'a> {
     length: Option<u64>,
     /// Number of threads to download a file with.
     threads: usize,
+    /// If the length is less than this threshold, threads will not be used.
+    parallel_threshold: usize,
+    /// If the length is less than this threshold, parts will be stored in memory.
+    memory_threshold: usize,
+    /// If defined, downloads will be stored here instead of a temporary directory.
+    cache_path: Option<PathBuf>,
     /// Optional progress callback to track progress.
     progress_callback: Option<(Box<FnMut(u64, u64)>, u64)>
 }
@@ -34,6 +41,9 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
             dest,
             length: None,
             threads: 4,
+            parallel_threshold: 0,
+            memory_threshold: 0,
+            cache_path: None,
             progress_callback: None,
         }
     }
@@ -82,6 +92,7 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
         let threads_running = Arc::new(());
         let nthreads = self.threads as u64;
         let tempdir = tempfile::tempdir()?;
+        let has_callback = self.progress_callback.is_some();
 
         for part in 0u64..nthreads {
             let running = threads_running.clone();
@@ -91,45 +102,26 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
             let progress = progress.clone();
             let handle = thread::spawn(move || {
                 let _running = running;
-
-                let range = if length == 0 {
-                    None
-                } else {
-                    let section = length / nthreads;
-                    let from = part * section;
-                    let to = if part + 1 == nthreads {
-                        length
-                    } else {
-                        (part + 1) * section
-                    } - 1;
-                    Some((from, to))
-                };
+                let range = get_range(length, nthreads, part);
                 
-                let part = fs::OpenOptions::new()
+                let mut part = fs::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .truncate(true)
                     .create(true)
                     .open(tempfile)?;
 
-                let mut writer = ProgressWriter::new(part, |written| {
-                    progress.fetch_add(written, Ordering::SeqCst);
-                });
+                if has_callback {
+                    let mut writer = ProgressWriter::new(part, |written| {
+                        progress.fetch_add(written, Ordering::SeqCst);
+                    });
 
-                let mut client = client.get(&url);
-
-                if let Some((from, to)) = range {
-                    client = client.header(RANGE, format!("bytes={}-{}", from, to));
+                    send_get_request(client, &mut writer, &url, range)?;
+                    part = writer.into_inner();
+                } else {
+                    send_get_request(client, &mut part, &url, range)?;
                 }
-                    
-                client.send()
-                    .map_err(|why| io::Error::new(io::ErrorKind::Other, format!("reqwest get failed: {}", why)))?
-                    .copy_to(&mut writer).map_err(|why|
-                        io::Error::new(io::ErrorKind::Other,
-                        format!("reqwest copy failed: {}", why))
-                    )?;
 
-                let mut part = writer.into_inner();
                 part.seek(SeekFrom::Start(0))?;
 
                 Ok(part)
@@ -156,6 +148,36 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
 
         Ok(progress.load(Ordering::SeqCst))
     }
+}
+
+fn get_range(length: u64, nthreads: u64, part: u64) -> Option<(u64, u64)> {
+    if length == 0 {
+        None
+    } else {
+        let section = length / nthreads;
+        let from = part * section;
+        let to = if part + 1 == nthreads {
+            length
+        } else {
+            (part + 1) * section
+        } - 1;
+        Some((from, to))
+    }
+}
+
+fn send_get_request(client: Arc<Client>, writer: &mut impl Write, url: &str, range: Option<(u64, u64)>) -> io::Result<u64> {
+    let mut client = client.get(url);
+
+    if let Some((from, to)) = range {
+        client = client.header(RANGE, format!("bytes={}-{}", from, to));
+    }
+        
+    client.send()
+        .map_err(|why| io::Error::new(io::ErrorKind::Other, format!("reqwest get failed: {}", why)))?
+        .copy_to(writer).map_err(|why|
+            io::Error::new(io::ErrorKind::Other,
+            format!("reqwest copy failed: {}", why))
+        )
 }
 
 fn get_content_length(client: &Client, url: &str) -> io::Result<u64> {
