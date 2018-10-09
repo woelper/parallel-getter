@@ -60,39 +60,29 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
 
     pub fn get(mut self) -> io::Result<usize> {
         let client = self.client.take().unwrap_or_else(|| Arc::new(Client::new()));
-        let nthreads = self.threads as u64;
-        let progress = Arc::new(AtomicUsize::new(0));
-        let threads_running = Arc::new(());
         let length = match self.length {
             Some(length) => length,
             None => {
-                let resp = client.head(self.url).send()
-                    .map_err(|why| io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("failed to send HEAD reqest: {}", why)
-                    ))?;
-
-                resp.headers().get(CONTENT_LENGTH)
-                    .ok_or(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "content length not found"
-                    ))?
-                    .to_str()
-                    .map_err(|_| io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Content-Length is not UTF-8"
-                    ))?
-                    .parse::<u64>()
-                    .map_err(|_| io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Content-Length did not have a valid u64 integer"
-                    ))?
+                match get_content_length(&client, self.url) {
+                    Ok(length) => length,
+                    Err(_) => {
+                        self.threads = 1;
+                        0
+                    }
+                }
             }
         };
 
-        let tempdir = tempfile::tempdir()?;
+        self.parallel_get(client, length)
+    }
+
+    fn parallel_get(self, client: Arc<Client>, length: u64) -> io::Result<usize> {
         let mut threads: Vec<JoinHandle<io::Result<File>>> = Vec::new();
-        
+        let progress = Arc::new(AtomicUsize::new(0));
+        let threads_running = Arc::new(());
+        let nthreads = self.threads as u64;
+        let tempdir = tempfile::tempdir()?;
+
         for part in 0u64..nthreads {
             let running = threads_running.clone();
             let tempfile = tempdir.path().join(format!("{}", part));
@@ -101,14 +91,20 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
             let progress = progress.clone();
             let handle = thread::spawn(move || {
                 let _running = running;
-                let section = length / nthreads;
-                let from = part * section;
-                let to = if part + 1 == nthreads {
-                    length
-                } else {
-                    (part + 1) * section
-                } - 1;
 
+                let range = if length == 0 {
+                    None
+                } else {
+                    let section = length / nthreads;
+                    let from = part * section;
+                    let to = if part + 1 == nthreads {
+                        length
+                    } else {
+                        (part + 1) * section
+                    } - 1;
+                    Some((from, to))
+                };
+                
                 let part = fs::OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -120,10 +116,13 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
                     progress.fetch_add(written, Ordering::SeqCst);
                 });
 
-                client
-                    .get(&url)
-                    .header(RANGE, format!("bytes={}-{}", from, to))
-                    .send()
+                let mut client = client.get(&url);
+
+                if let Some((from, to)) = range {
+                    client = client.header(RANGE, format!("bytes={}-{}", from, to));
+                }
+                    
+                client.send()
                     .map_err(|why| io::Error::new(io::ErrorKind::Other, format!("reqwest get failed: {}", why)))?
                     .copy_to(&mut writer).map_err(|why|
                         io::Error::new(io::ErrorKind::Other,
@@ -157,4 +156,28 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
 
         Ok(progress.load(Ordering::SeqCst))
     }
+}
+
+fn get_content_length(client: &Client, url: &str) -> io::Result<u64> {
+    let resp = client.head(url).send()
+        .map_err(|why| io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to send HEAD reqest: {}", why)
+        ))?;
+
+    resp.headers().get(CONTENT_LENGTH)
+        .ok_or(io::Error::new(
+            io::ErrorKind::NotFound,
+            "content length not found"
+        ))?
+        .to_str()
+        .map_err(|_| io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Content-Length is not UTF-8"
+        ))?
+        .parse::<u64>()
+        .map_err(|_| io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Content-Length did not have a valid u64 integer"
+        ))
 }
