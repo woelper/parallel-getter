@@ -9,15 +9,15 @@ use reqwest::{Client, header::{
 }};
 use std::thread::{self, JoinHandle};
 use std::fs::{self, File};
-use std::io::{self, Seek, SeekFrom};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-pub struct ParallelGetter<'a> {
+pub struct ParallelGetter<'a, W: Write + 'a> {
     client: Option<Arc<Client>>,
     url: &'a str,
-    dest: &'a str,
+    dest: &'a mut W,
     /// If no length is provided, a HEAD request will be used to fetch it.
     length: Option<u64>,
     /// Number of threads to download a file with.
@@ -26,8 +26,8 @@ pub struct ParallelGetter<'a> {
     progress_callback: Option<(Box<FnMut(u64, u64)>, u64)>
 }
 
-impl<'a> ParallelGetter<'a> {
-    pub fn new(url: &'a str, dest: &'a str) -> Self {
+impl<'a, W: Write> ParallelGetter<'a, W> {
+    pub fn new(url: &'a str, dest: &'a mut W) -> Self {
         Self {
             client: None,
             url,
@@ -134,12 +134,6 @@ impl<'a> ParallelGetter<'a> {
             threads.push(handle);
         }
 
-        let mut dest = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.dest)?;
-
         if let Some((mut progress_callback, mut poll_ms)) = self.progress_callback {
             // Poll for progress until all background threads have exited.
             poll_ms = if poll_ms == 0 { 1 } else { poll_ms };
@@ -153,7 +147,7 @@ impl<'a> ParallelGetter<'a> {
 
         for handle in threads {
             let mut file = handle.join().unwrap()?;
-            io::copy(&mut file, &mut dest)?;
+            io::copy(&mut file, self.dest)?;
         }
 
         Ok(())
