@@ -30,7 +30,7 @@ pub struct ParallelGetter<'a, W: Write + 'a> {
     /// If defined, downloads will be stored here instead of a temporary directory.
     cache_path: Option<PathBuf>,
     /// Optional progress callback to track progress.
-    progress_callback: Option<(Box<FnMut(u64, u64)>, u64)>
+    progress_callback: Option<(Arc<Fn(u64, u64)>, u64)>
 }
 
 impl<'a, W: Write> ParallelGetter<'a, W> {
@@ -48,6 +48,11 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
         }
     }
 
+    pub fn callback(mut self, poll_ms: u64, func: Arc<Fn(u64, u64)>) -> Self {
+        self.progress_callback = Some((func, poll_ms));
+        self
+    }
+
     pub fn client(mut self, client: Arc<Client>) -> Self {
         self.client = Some(client);
         self
@@ -60,11 +65,6 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
 
     pub fn threads(mut self, threads: usize) -> Self {
         self.threads = threads;
-        self
-    }
-
-    pub fn callback(mut self, poll_ms: u64, func: Box<FnMut(u64, u64)>) -> Self {
-        self.progress_callback = Some((func, poll_ms));
         self
     }
 
@@ -130,7 +130,7 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
             threads.push(handle);
         }
 
-        if let Some((mut progress_callback, mut poll_ms)) = self.progress_callback {
+        if let Some((progress_callback, mut poll_ms)) = self.progress_callback {
             // Poll for progress until all background threads have exited.
             poll_ms = if poll_ms == 0 { 1 } else { poll_ms };
             while Arc::strong_count(&threads_running) != 1 {
