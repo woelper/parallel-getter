@@ -53,7 +53,7 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
         self
     }
 
-    pub fn get(mut self) -> io::Result<()> {
+    pub fn get(mut self) -> io::Result<usize> {
         let client = self.client.take().unwrap_or_else(|| Arc::new(Client::new()));
         let nthreads = self.threads as u64;
         let progress = Arc::new(AtomicUsize::new(0));
@@ -150,6 +150,6 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
             io::copy(&mut file, self.dest)?;
         }
 
-        Ok(())
+        Ok(progress.load(Ordering::SeqCst))
     }
 }
