@@ -1,10 +1,15 @@
 [package]
 name = "parallel-getter"
 version = "0.1.0"
+description = "Fetch a file with parallel GET requests"
+repository = "https://github.com/pop-os/parallel-getter"
 authors = ["Michael Aaron Murphy <mmstickman@gmail.com>"]
 license = "MIT"
+readme = "README.md"
+keywords = ["parallel", "download", "get"]
+categories = ["network-programming"]
 
 [dependencies]
-progress-streams = { git = "https://github.com/pop-os/progress-streams" }
+progress-streams = "1.0.0"
 reqwest = "0.9.2"
 tempfile = "3.0.4"

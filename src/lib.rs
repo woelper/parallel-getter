@@ -1,3 +1,40 @@
+//! When fetching a file from a web server via GET, it is possible to define a range of bytes to
+//! receive per request. This allows the possibility of using multiple GET requests on the same
+//! URL to increase the throughput of a transfer for that file. Once the parts have been fetched,
+//! they are concatenated into a single file.
+//! 
+//! Therefore, this crate will make it trivial to set up a parallel GET request, with an API that
+//! provides a configurable number of threads and an optional callback to monitor the progress of
+//! a transfer.
+//! 
+//! ## Example
+//! 
+//! ```rust,no_run
+//! extern crate parallel_getter;
+//! 
+//! use parallel_getter::ParallelGetter;
+//! use std::fs::File;
+//! 
+//! fn main() {
+//!     let url = "http://apt.pop-os.org/proprietary/pool/bionic/main/\
+//!         binary-amd64/a/atom/atom_1.31.1_amd64.deb";
+//!     let mut file = File::create("atom_1.31.1_amd64.deb").unwrap();
+//!     let result = ParallelGetter::new(url, &mut file)
+//!         .threads(4)
+//!         .callback(1000, Box::new(|p, t| {
+//!             println!(
+//!                 "{} of {} KiB downloaded",
+//!                 p / 1024,
+//!                 t / 1024);
+//!         }))
+//!         .get();
+//! 
+//!     if let Err(why) = result {
+//!         eprintln!("errored: {}", why);
+//!     }
+//! }
+//! ```
+
 extern crate progress_streams;
 extern crate reqwest;
 extern crate tempfile;
@@ -9,12 +46,48 @@ use reqwest::{Client, header::{
 }};
 use std::thread::{self, JoinHandle};
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+/// Type for constructing parallel GET requests.
+/// 
+/// # Example
+/// 
+/// ```rust,no_run
+/// extern crate reqwest;
+/// extern crate parallel_getter;
+/// 
+/// use reqwest::Client;
+/// use parallel_getter::ParallelGetter;
+/// use std::fs::File;
+/// use std::path::PathBuf;
+/// use std::sync::Arc;
+/// 
+/// let client = Arc::new(Client::new());
+/// let mut file = File::create("new_file").unwrap();
+/// ParallelGetter::new("url_here", &mut file)
+///     // Optional client to use for the request.
+///     .client(client)
+///     // Optional path to store the parts.
+///     .cache_path(PathBuf::from("/a/path/here"))
+///     // Number of theads to use.
+///     .threads(5)
+///     // threshold in file length for using parallel requests.
+///     .parallel_threshold(1 * 1024 * 1024)
+///     // Callback for monitoring progress.
+///     .callback(16, Box::new(|progress, total| {
+///         println!(
+///             "{} of {} KiB downloaded",
+///             progress / 1024,
+///             total / 1024
+///         );
+///     }))
+///     // Commit the parallel GET requests.
+///     .get();
+/// ```
 pub struct ParallelGetter<'a, W: Write + 'a> {
     client: Option<Arc<Client>>,
     url: &'a str,
@@ -22,12 +95,18 @@ pub struct ParallelGetter<'a, W: Write + 'a> {
     length: Option<u64>,
     threads: usize,
     parallel_threshold: Option<u64>,
-    memory_threshold:   Option<u64>,
+    memory_threshold: Option<u64>,
     cache_path: Option<PathBuf>,
-    progress_callback: Option<(Arc<Fn(u64, u64)>, u64)>
+    progress_callback: Option<(Box<Fn(u64, u64)>, u64)>
 }
 
 impl<'a, W: Write> ParallelGetter<'a, W> {
+    /// Initialize a new `ParallelGetter`
+    /// 
+    /// # Notes
+    /// - The `url` is the location which we will send a GET to.
+    /// - The `dest` is where the completed file will be written to.
+    /// - By default, 4 threads will be used.
     pub fn new(url: &'a str, dest: &'a mut W) -> Self {
         Self {
             client: None,
@@ -40,48 +119,6 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
             cache_path: None,
             progress_callback: None,
         }
-    }
-
-    /// If defined, downloads will be stored here instead of a temporary directory.
-    pub fn cache_path(mut self, path: PathBuf) -> Self {
-        self.cache_path = Some(path);
-        self
-    }
-
-    /// If the length is less than this threshold, threads will not be used.
-    pub fn parallel_threshold(mut self, length: u64) -> Self {
-        self.parallel_threshold = Some(length);
-        self
-    }
-
-    /// Specify a callback for monitoring progress, to be polled at the given interval.
-    pub fn callback(mut self, poll_ms: u64, func: Arc<Fn(u64, u64)>) -> Self {
-        self.progress_callback = Some((func, poll_ms));
-        self
-    }
-
-    /// Allow the caller to provide their own `Client`.
-    pub fn client(mut self, client: Arc<Client>) -> Self {
-        self.client = Some(client);
-        self
-    }
-
-    /// Specifies the length of the file, to avoid a HEAD request to find out.
-    pub fn length(mut self, length: u64) -> Self {
-        self.length = Some(length);
-        self
-    }
-
-    // /// If the length is less than this threshold, parts will be stored in memory.
-    // pub fn memory_threshold(mut self, length: u64) -> Self {
-    //     self.memory_threshold = Some(length);
-    //     self
-    // }
-
-    /// Number of threads to download a file with.
-    pub fn threads(mut self, threads: usize) -> Self {
-        self.threads = threads;
-        self
     }
 
     /// Submit the parallel GET request.
@@ -109,6 +146,51 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
         };
 
         self.parallel_get(client, length)
+    }
+
+    /// If defined, downloads will be stored here instead of a temporary directory.
+    /// 
+    /// # Notes
+    /// This is required to enable resumable downloads (not yet implemented).
+    pub fn cache_path(mut self, path: PathBuf) -> Self {
+        self.cache_path = Some(path);
+        self
+    }
+
+    /// Specify a callback for monitoring progress, to be polled at the given interval.
+    pub fn callback(mut self, poll_ms: u64, func: Box<Fn(u64, u64)>) -> Self {
+        self.progress_callback = Some((func, poll_ms));
+        self
+    }
+
+    /// Allow the caller to provide their own `Client`.
+    pub fn client(mut self, client: Arc<Client>) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// Specifies the length of the file, to avoid a HEAD request to find out.
+    pub fn length(mut self, bytes: u64) -> Self {
+        self.length = Some(bytes);
+        self
+    }
+
+    /// If the length is less than this threshold, parts will be stored in memory.
+    pub fn memory_threshold(mut self, length: u64) -> Self {
+        self.memory_threshold = Some(length);
+        self
+    }
+
+    /// If the length is less than this threshold, threads will not be used.
+    pub fn parallel_threshold(mut self, bytes: u64) -> Self {
+        self.parallel_threshold = Some(bytes);
+        self
+    }
+
+    /// Number of threads to download a file with.
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
     }
 
     fn parallel_get(self, client: Arc<Client>, length: u64) -> io::Result<usize> {
@@ -219,7 +301,7 @@ fn get_content_length(client: &Client, url: &str) -> io::Result<u64> {
         ))?;
 
     resp.headers().get(CONTENT_LENGTH)
-        .ok_or(io::Error::new(
+        .ok_or_else(|| io::Error::new(
             io::ErrorKind::NotFound,
             "content length not found"
         ))?
