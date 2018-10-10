@@ -35,18 +35,20 @@
 //! }
 //! ```
 
+extern crate numtoa;
 extern crate progress_streams;
 extern crate reqwest;
 extern crate tempfile;
 
+use numtoa::NumToA;
 use progress_streams::ProgressWriter;
 use reqwest::{Client, header::{
     CONTENT_LENGTH,
     RANGE,
 }};
 use std::thread::{self, JoinHandle};
-use std::fs::{self, File};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::fs;
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -75,8 +77,10 @@ use std::time::Duration;
 ///     .cache_path(PathBuf::from("/a/path/here"))
 ///     // Number of theads to use.
 ///     .threads(5)
-///     // threshold in file length for using parallel requests.
-///     .parallel_threshold(1 * 1024 * 1024)
+///     // threshold (length in bytes) to determine when multiple threads are required.
+///     .threshold_parallel(1 * 1024 * 1024)
+///     // threshold for defining when to store parts in memory or on disk.
+///     .threshold_memory(10 * 1024 * 1024)
 ///     // Callback for monitoring progress.
 ///     .callback(16, Box::new(|progress, total| {
 ///         println!(
@@ -94,8 +98,8 @@ pub struct ParallelGetter<'a, W: Write + 'a> {
     dest: &'a mut W,
     length: Option<u64>,
     threads: usize,
-    parallel_threshold: Option<u64>,
-    memory_threshold: Option<u64>,
+    threshold_parallel: Option<u64>,
+    threshold_memory: Option<u64>,
     cache_path: Option<PathBuf>,
     progress_callback: Option<(Box<Fn(u64, u64)>, u64)>
 }
@@ -114,8 +118,8 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
             dest,
             length: None,
             threads: 4,
-            parallel_threshold: None,
-            memory_threshold: None,
+            threshold_parallel: None,
+            threshold_memory: None,
             cache_path: None,
             progress_callback: None,
         }
@@ -129,7 +133,7 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
             None => {
                 match get_content_length(&client, self.url) {
                     Ok(length) => {
-                        if let Some(threshold) = self.parallel_threshold {
+                        if let Some(threshold) = self.threshold_parallel {
                             if length < threshold {
                                 self.threads = 1;
                             }
@@ -145,7 +149,14 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
             }
         };
 
-        self.parallel_get(client, length)
+        let result = self.parallel_get(client, length);
+
+        // Ensure that the progress is completed when returning.
+        if let Some((callback, _)) = self.progress_callback {
+            callback(length, length);
+        }
+
+        result
     }
 
     /// If defined, downloads will be stored here instead of a temporary directory.
@@ -176,14 +187,14 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
     }
 
     /// If the length is less than this threshold, parts will be stored in memory.
-    pub fn memory_threshold(mut self, length: u64) -> Self {
-        self.memory_threshold = Some(length);
+    pub fn threshold_memory(mut self, length: u64) -> Self {
+        self.threshold_memory = Some(length);
         self
     }
 
     /// If the length is less than this threshold, threads will not be used.
-    pub fn parallel_threshold(mut self, bytes: u64) -> Self {
-        self.parallel_threshold = Some(bytes);
+    pub fn threshold_parallel(mut self, bytes: u64) -> Self {
+        self.threshold_parallel = Some(bytes);
         self
     }
 
@@ -193,12 +204,11 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
         self
     }
 
-    fn parallel_get(self, client: Arc<Client>, length: u64) -> io::Result<usize> {
+    fn parallel_get(&mut self, client: Arc<Client>, length: u64) -> io::Result<usize> {
         let mut threads = Vec::new();
         let progress = Arc::new(AtomicUsize::new(0));
         let nthreads = self.threads as u64;
         let has_callback = self.progress_callback.is_some();
-        // let memory_threshold = self.memory_threshold;
 
         let tempdir;
         let cache_path = match self.cache_path {
@@ -209,41 +219,61 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
             }
         };
 
+        let url_hash = hash(self.url);
+        let mut parts = Vec::new();
+
         for part in 0u64..nthreads {
-            let tempfile = cache_path.join(format!("{}", part));
+            let mut part: Box<dyn PartWriter> = match self.threshold_memory {
+                Some(threshold) if threshold > length => {
+                    Box::new(Cursor::new(
+                        Vec::with_capacity((length / nthreads) as usize)
+                    ))
+                }
+                _ => {
+                    let mut array = [0u8; 20];
+                    let name = [&url_hash, "-", part.numtoa_str(10, &mut array)].concat();
+                    let tempfile = cache_path.join(&name);
+                    Box::new(
+                        fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .truncate(true)
+                            .create(true)
+                            .open(tempfile)?
+                    )
+                }
+            };
+
+            parts.push(part);
+        }
+
+        for (part, mut part_file) in (0u64..nthreads).zip(parts.into_iter()) {
             let client = client.clone();
             let url = self.url.to_owned();
             let progress = progress.clone();
-            let handle: JoinHandle<io::Result<File>> = thread::spawn(move || {
+
+            let handle: JoinHandle<io::Result<_>> = thread::spawn(move || {
                 let range = get_range(length, nthreads, part);
 
-                let mut part = fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .truncate(true)
-                    .create(true)
-                    .open(tempfile)?;
-
                 if has_callback {
-                    let mut writer = ProgressWriter::new(part, |written| {
+                    let mut writer = ProgressWriter::new(&mut part_file, |written| {
                         progress.fetch_add(written, Ordering::SeqCst);
                     });
 
                     send_get_request(client, &mut writer, &url, range)?;
-                    part = writer.into_inner();
                 } else {
-                    send_get_request(client, &mut part, &url, range)?;
+                    send_get_request(client, &mut part_file, &url, range)?;
                 }
 
-                part.seek(SeekFrom::Start(0))?;
+                part_file.seek(SeekFrom::Start(0))?;
 
-                Ok(part)
+                Ok(part_file)
             });
 
             threads.push(handle);
         }
 
-        if let Some((progress_callback, mut poll_ms)) = self.progress_callback {
+        if let Some((ref progress_callback, mut poll_ms)) = self.progress_callback {
             // Poll for progress until all background threads have exited.
             poll_ms = if poll_ms == 0 { 1 } else { poll_ms };
             while Arc::strong_count(&progress) != 1 {
@@ -261,6 +291,20 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
 
         Ok(progress.load(Ordering::SeqCst))
     }
+}
+
+trait PartWriter: Send + Seek + Read + Write {}
+impl<T: Send + Seek + Read + Write> PartWriter for T {}
+
+fn get_range_string(from: u64, to: u64) -> String {
+    let mut from_a = [0u8; 20];
+    let mut to_a = [0u8; 20];
+    [
+        "bytes=",
+        from.numtoa_str(10, &mut from_a),
+        "-",
+        to.numtoa_str(10, &mut to_a)
+    ].concat()
 }
 
 fn get_range(length: u64, nthreads: u64, part: u64) -> Option<(u64, u64)> {
@@ -282,7 +326,7 @@ fn send_get_request(client: Arc<Client>, writer: &mut impl Write, url: &str, ran
     let mut client = client.get(url);
 
     if let Some((from, to)) = range {
-        client = client.header(RANGE, format!("bytes={}-{}", from, to));
+        client = client.header(RANGE, get_range_string(from, to).as_str());
     }
 
     client.send()
@@ -315,4 +359,13 @@ fn get_content_length(client: &Client, url: &str) -> io::Result<u64> {
             io::ErrorKind::InvalidData,
             "Content-Length did not have a valid u64 integer"
         ))
+}
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+fn hash(string: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    string.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
 }

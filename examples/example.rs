@@ -9,6 +9,7 @@ fn main() {
     let mut file = File::create("atom_1.31.1_amd64.deb").unwrap();
     let result = ParallelGetter::new(url, &mut file)
         .threads(4)
+        .threshold_memory(10 * 1024 * 1024)
         .callback(1000, Box::new(|p, t| {
             println!(
                 "{} of {} KiB downloaded",
