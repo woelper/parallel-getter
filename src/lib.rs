@@ -2,19 +2,19 @@
 //! receive per request. This allows the possibility of using multiple GET requests on the same
 //! URL to increase the throughput of a transfer for that file. Once the parts have been fetched,
 //! they are concatenated into a single file.
-//! 
+//!
 //! Therefore, this crate will make it trivial to set up a parallel GET request, with an API that
 //! provides a configurable number of threads and an optional callback to monitor the progress of
 //! a transfer.
-//! 
+//!
 //! ## Example
-//! 
+//!
 //! ```rust,no_run
 //! extern crate parallel_getter;
-//! 
+//!
 //! use parallel_getter::ParallelGetter;
 //! use std::fs::File;
-//! 
+//!
 //! fn main() {
 //!     let url = "http://apt.pop-os.org/proprietary/pool/bionic/main/\
 //!         binary-amd64/a/atom/atom_1.31.1_amd64.deb";
@@ -28,7 +28,7 @@
 //!                 t / 1024);
 //!         }))
 //!         .get();
-//! 
+//!
 //!     if let Err(why) = result {
 //!         eprintln!("errored: {}", why);
 //!     }
@@ -44,6 +44,7 @@ use numtoa::NumToA;
 use progress_streams::ProgressWriter;
 use reqwest::{Client, header::{
     CONTENT_LENGTH,
+    CONTENT_RANGE,
     RANGE,
 }};
 use std::thread::{self, JoinHandle};
@@ -52,22 +53,22 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Type for constructing parallel GET requests.
-/// 
+///
 /// # Example
-/// 
+///
 /// ```rust,no_run
 /// extern crate reqwest;
 /// extern crate parallel_getter;
-/// 
+///
 /// use reqwest::Client;
 /// use parallel_getter::ParallelGetter;
 /// use std::fs::File;
 /// use std::path::PathBuf;
 /// use std::sync::Arc;
-/// 
+///
 /// let client = Arc::new(Client::new());
 /// let mut file = File::create("new_file").unwrap();
 /// ParallelGetter::new("url_here", &mut file)
@@ -106,7 +107,7 @@ pub struct ParallelGetter<'a, W: Write + 'a> {
 
 impl<'a, W: Write> ParallelGetter<'a, W> {
     /// Initialize a new `ParallelGetter`
-    /// 
+    ///
     /// # Notes
     /// - The `url` is the location which we will send a GET to.
     /// - The `dest` is where the completed file will be written to.
@@ -160,7 +161,7 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
     }
 
     /// If defined, downloads will be stored here instead of a temporary directory.
-    /// 
+    ///
     /// # Notes
     /// This is required to enable resumable downloads (not yet implemented).
     pub fn cache_path(mut self, path: PathBuf) -> Self {
@@ -276,11 +277,17 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
         if let Some((ref progress_callback, mut poll_ms)) = self.progress_callback {
             // Poll for progress until all background threads have exited.
             poll_ms = if poll_ms == 0 { 1 } else { poll_ms };
+            let poll_ms = Duration::from_millis(poll_ms);
+
+            let mut time_since_update = Instant::now();
             while Arc::strong_count(&progress) != 1 {
                 let progress = progress.load(Ordering::SeqCst) as u64;
-                progress_callback(progress, length);
+                if time_since_update.elapsed() > poll_ms {
+                    progress_callback(progress, length);
+                }
+                
                 if progress >= length { break }
-                thread::sleep(Duration::from_millis(poll_ms));
+                thread::sleep(Duration::from_millis(1));
             }
         }
 
@@ -329,9 +336,13 @@ fn send_get_request(client: Arc<Client>, writer: &mut impl Write, url: &str, ran
         client = client.header(RANGE, get_range_string(from, to).as_str());
     }
 
-    client.send()
-        .map_err(|why| io::Error::new(io::ErrorKind::Other, format!("reqwest get failed: {}", why)))?
-        .copy_to(writer).map_err(|why|
+    let mut response = client.send()
+        .map_err(|why| io::Error::new(
+            io::ErrorKind::Other,
+            format!("reqwest get failed: {}", why))
+        )?;
+
+    response.copy_to(writer).map_err(|why|
             io::Error::new(io::ErrorKind::Other,
             format!("reqwest copy failed: {}", why))
         )
