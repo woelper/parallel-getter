@@ -35,25 +35,32 @@
 //! }
 //! ```
 
+extern crate crossbeam;
 extern crate numtoa;
 extern crate progress_streams;
 extern crate reqwest;
 extern crate tempfile;
 
+mod range;
+
+use crossbeam::thread::ScopedJoinHandle;
 use numtoa::NumToA;
 use progress_streams::ProgressWriter;
-use reqwest::{Client, header::{
+use reqwest::{Client, StatusCode, header::{
     CONTENT_LENGTH,
     CONTENT_RANGE,
     RANGE,
 }};
-use std::thread::{self, JoinHandle};
-use std::fs;
+use self::range::{calc_range, range_header, range_string};
+use std::{fs, thread};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+trait PartWriter: Send + Seek + Read + Write {}
+impl<T: Send + Seek + Read + Write> PartWriter for T {}
 
 /// Type for constructing parallel GET requests.
 ///
@@ -72,6 +79,8 @@ use std::time::{Duration, Instant};
 /// let client = Arc::new(Client::new());
 /// let mut file = File::create("new_file").unwrap();
 /// ParallelGetter::new("url_here", &mut file)
+///     // Additional mirrors that can be used.
+///     .mirrors(&["mirror_a", "mirror_b"])
 ///     // Optional client to use for the request.
 ///     .client(client)
 ///     // Optional path to store the parts.
@@ -95,12 +104,12 @@ use std::time::{Duration, Instant};
 /// ```
 pub struct ParallelGetter<'a, W: Write + 'a> {
     client: Option<Arc<Client>>,
-    url: &'a str,
+    urls: Vec<&'a str>,
     dest: &'a mut W,
-    length: Option<u64>,
     threads: usize,
     threshold_parallel: Option<u64>,
     threshold_memory: Option<u64>,
+    tries: u32,
     cache_path: Option<PathBuf>,
     progress_callback: Option<(Box<Fn(u64, u64)>, u64)>
 }
@@ -115,12 +124,12 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
     pub fn new(url: &'a str, dest: &'a mut W) -> Self {
         Self {
             client: None,
-            url,
+            urls: vec![url],
             dest,
-            length: None,
             threads: 4,
             threshold_parallel: None,
             threshold_memory: None,
+            tries: 3,
             cache_path: None,
             progress_callback: None,
         }
@@ -129,24 +138,19 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
     /// Submit the parallel GET request.
     pub fn get(mut self) -> io::Result<usize> {
         let client = self.client.take().unwrap_or_else(|| Arc::new(Client::new()));
-        let length = match self.length {
-            Some(length) => length,
-            None => {
-                match get_content_length(&client, self.url) {
-                    Ok(length) => {
-                        if let Some(threshold) = self.threshold_parallel {
-                            if length < threshold {
-                                self.threads = 1;
-                            }
-                        }
-
-                        length
-                    },
-                    Err(_) => {
+        let length = match get_content_length(&client, self.urls[0]) {
+            Ok(length) => {
+                if let Some(threshold) = self.threshold_parallel {
+                    if length < threshold {
                         self.threads = 1;
-                        0
                     }
                 }
+
+                length
+            },
+            Err(_) => {
+                self.threads = 1;
+                0
             }
         };
 
@@ -181,9 +185,16 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
         self
     }
 
-    /// Specifies the length of the file, to avoid a HEAD request to find out.
-    pub fn length(mut self, bytes: u64) -> Self {
-        self.length = Some(bytes);
+    /// Specify additional URLs that point to the same content, to be used for boosted transfers.
+    pub fn mirrors(mut self, mirrors: &'a [&'a str]) -> Self {
+        self.urls.truncate(1);
+        self.urls.extend_from_slice(mirrors);
+        self
+    }
+
+    /// Number of attempts to make before giving up.
+    pub fn retries(mut self, tries: u32) -> Self {
+        self.tries = tries;
         self
     }
 
@@ -205,22 +216,13 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
         self
     }
 
-    fn parallel_get(&mut self, client: Arc<Client>, length: u64) -> io::Result<usize> {
-        let mut threads = Vec::new();
-        let progress = Arc::new(AtomicUsize::new(0));
-        let nthreads = self.threads as u64;
-        let has_callback = self.progress_callback.is_some();
-
-        let tempdir;
-        let cache_path = match self.cache_path {
-            Some(ref path) => path.as_path(),
-            None => {
-                tempdir = tempfile::tempdir()?;
-                tempdir.path()
-            }
-        };
-
-        let url_hash = hash(self.url);
+    fn create_parts(
+        &self,
+        cache_path: &Path,
+        length: u64,
+        nthreads: u64,
+        url_hash: &str
+    ) -> io::Result<Vec<Box<dyn PartWriter>>> {
         let mut parts = Vec::new();
 
         for part in 0u64..nthreads {
@@ -248,92 +250,140 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
             parts.push(part);
         }
 
-        for (part, mut part_file) in (0u64..nthreads).zip(parts.into_iter()) {
-            let client = client.clone();
-            let url = self.url.to_owned();
+        Ok(parts)
+    }
+
+    fn parallel_get(&mut self, client: Arc<Client>, length: u64) -> io::Result<usize> {
+        let progress = Arc::new(AtomicUsize::new(0));
+        let nthreads = self.threads as u64;
+
+        let has_callback = self.progress_callback.is_some();
+        let progress_callback = self.progress_callback.take();
+        let tries = self.tries;
+        let urls = &self.urls;
+
+        let tempdir;
+        let cache_path = match self.cache_path {
+            Some(ref path) => path.as_path(),
+            None => {
+                tempdir = tempfile::tempdir()?;
+                tempdir.path()
+            }
+        };
+
+        let url_hash = hash(urls[0]);
+        let parts = self.create_parts(cache_path, length, nthreads, &url_hash)?;
+        let dest = &mut self.dest;
+
+        let result: io::Result<()> = {
             let progress = progress.clone();
+            crossbeam::scope(move |scope| {
+                let mut threads = Vec::new();
+                for (part, mut part_file) in (0u64..nthreads).zip(parts.into_iter()) {
+                    let client = client.clone();
+                    let progress = progress.clone();
 
-            let handle: JoinHandle<io::Result<_>> = thread::spawn(move || {
-                let range = get_range(length, nthreads, part);
+                    let local_progress = Arc::new(AtomicUsize::new(0));
+                    let local = local_progress.clone();
+                    let handle: ScopedJoinHandle<io::Result<_>> = scope.spawn(move || {
+                        let range = calc_range(length, nthreads, part);
 
-                if has_callback {
-                    let mut writer = ProgressWriter::new(&mut part_file, |written| {
-                        progress.fetch_add(written, Ordering::SeqCst);
+                        for tried in 0..tries {
+                            let url = urls[((part as usize) + tried as usize) % urls.len()];
+                            let result = attempt_get(
+                                client.clone(), &mut part_file, url, &progress,
+                                &local, length, range, has_callback
+                            );
+
+                            match result {
+                                Ok(()) => break,
+                                Err(why) => {
+                                    progress.fetch_sub(local.load(Ordering::SeqCst), Ordering::SeqCst);
+                                    local.store(0, Ordering::SeqCst);
+                                    part_file.seek(SeekFrom::Start(0))?;
+                                    if tried == tries-1 {
+                                        return Err(why);
+                                    }
+                                }
+                            }
+                        }
+
+                        part_file.seek(SeekFrom::Start(0))?;
+
+                        Ok(part_file)
                     });
 
-                    send_get_request(client, &mut writer, &url, range)?;
-                } else {
-                    send_get_request(client, &mut part_file, &url, range)?;
+                    threads.push(handle);
                 }
 
-                part_file.seek(SeekFrom::Start(0))?;
+                if let Some((ref progress_callback, mut poll_ms)) = progress_callback {
+                    // Poll for progress until all background threads have exited.
+                    poll_ms = if poll_ms == 0 { 1 } else { poll_ms };
+                    let poll_ms = Duration::from_millis(poll_ms);
 
-                Ok(part_file)
-            });
+                    let mut time_since_update = Instant::now();
+                    while Arc::strong_count(&progress) != 1 {
+                        let progress = progress.load(Ordering::SeqCst) as u64;
+                        if time_since_update.elapsed() > poll_ms {
+                            progress_callback(progress, length);
+                            time_since_update = Instant::now();
+                        }
 
-            threads.push(handle);
-        }
-
-        if let Some((ref progress_callback, mut poll_ms)) = self.progress_callback {
-            // Poll for progress until all background threads have exited.
-            poll_ms = if poll_ms == 0 { 1 } else { poll_ms };
-            let poll_ms = Duration::from_millis(poll_ms);
-
-            let mut time_since_update = Instant::now();
-            while Arc::strong_count(&progress) != 1 {
-                let progress = progress.load(Ordering::SeqCst) as u64;
-                if time_since_update.elapsed() > poll_ms {
-                    progress_callback(progress, length);
+                        if progress >= length { break }
+                        thread::sleep(Duration::from_millis(1));
+                    }
                 }
-                
-                if progress >= length { break }
-                thread::sleep(Duration::from_millis(1));
-            }
-        }
 
-        for handle in threads {
-            let mut file = handle.join().unwrap()?;
-            io::copy(&mut file, self.dest)?;
-        }
+                for handle in threads {
+                    let mut file = handle.join().unwrap()?;
+                    io::copy(&mut file, dest)?;
+                }
+
+                Ok(())
+            })
+        };
+
+        result?;
 
         Ok(progress.load(Ordering::SeqCst))
     }
 }
 
-trait PartWriter: Send + Seek + Read + Write {}
-impl<T: Send + Seek + Read + Write> PartWriter for T {}
+fn attempt_get(
+    client: Arc<Client>,
+    part: &mut Box<dyn PartWriter>,
+    url: &str,
+    progress: &AtomicUsize,
+    local: &AtomicUsize,
+    length: u64,
+    range: Option<(u64, u64)>,
+    has_callback: bool,
+) -> io::Result<()> {
+    if has_callback {
+        let mut writer = ProgressWriter::new(part, |written| {
+            progress.fetch_add(written, Ordering::SeqCst);
+            local.fetch_add(written, Ordering::SeqCst);
+        });
 
-fn get_range_string(from: u64, to: u64) -> String {
-    let mut from_a = [0u8; 20];
-    let mut to_a = [0u8; 20];
-    [
-        "bytes=",
-        from.numtoa_str(10, &mut from_a),
-        "-",
-        to.numtoa_str(10, &mut to_a)
-    ].concat()
-}
-
-fn get_range(length: u64, nthreads: u64, part: u64) -> Option<(u64, u64)> {
-    if length == 0 || nthreads == 1 {
-        None
+        send_get_request(client, &mut writer, url, length, range)?;
     } else {
-        let section = length / nthreads;
-        let from = part * section;
-        let to = if part + 1 == nthreads {
-            length
-        } else {
-            (part + 1) * section
-        } - 1;
-        Some((from, to))
+        send_get_request(client, part, url, length, range)?;
     }
+
+    Ok(())
 }
 
-fn send_get_request(client: Arc<Client>, writer: &mut impl Write, url: &str, range: Option<(u64, u64)>) -> io::Result<u64> {
+fn send_get_request(
+    client: Arc<Client>,
+    writer: &mut impl Write,
+    url: &str,
+    length: u64,
+    range: Option<(u64, u64)>
+) -> io::Result<u64> {
     let mut client = client.get(url);
 
     if let Some((from, to)) = range {
-        client = client.header(RANGE, get_range_string(from, to).as_str());
+        client = client.header(RANGE, range_string(from, to).as_str());
     }
 
     let mut response = client.send()
@@ -342,9 +392,37 @@ fn send_get_request(client: Arc<Client>, writer: &mut impl Write, url: &str, ran
             format!("reqwest get failed: {}", why))
         )?;
 
-    response.copy_to(writer).map_err(|why|
-            io::Error::new(io::ErrorKind::Other,
-            format!("reqwest copy failed: {}", why))
+    if let Some((from, to)) = range {
+        if response.status() != StatusCode::PARTIAL_CONTENT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "server did not return a partial request"
+            ));
+        }
+
+        match response.headers().get(CONTENT_RANGE) {
+            Some(header) => range_header(header, from, to, length)?,
+            None => return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "server did not return a `content-range` header"
+            ))
+        }
+    } else {
+        let status = response.status();
+        if status != StatusCode::OK {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("server returned an error: {}", status)
+            ));
+        }
+    }
+
+    response.copy_to(writer)
+        .map_err(|why|
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("reqwest copy failed: {}", why)
+            )
         )
 }
 
