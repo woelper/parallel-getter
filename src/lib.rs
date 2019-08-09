@@ -111,7 +111,8 @@ pub struct ParallelGetter<'a, W: Write + 'a> {
     threshold_memory: Option<u64>,
     tries: u32,
     cache_path: Option<PathBuf>,
-    progress_callback: Option<(Box<Fn(u64, u64)>, u64)>
+    progress_callback: Option<(Box<Fn(u64, u64)>, u64)>,
+    headers: Option<Arc<Vec<[String; 2]>>>,
 }
 
 impl<'a, W: Write> ParallelGetter<'a, W> {
@@ -132,6 +133,7 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
             tries: 3,
             cache_path: None,
             progress_callback: None,
+            headers: None,
         }
     }
 
@@ -216,6 +218,12 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
         self
     }
 
+    /// aditional headers to be set on requests
+    pub fn headers(mut self, headers: Arc<Vec<[String; 2]>>) -> Self {
+        self.headers = Some(headers);
+        self
+    }
+
     fn create_parts(
         &self,
         cache_path: &Path,
@@ -261,6 +269,7 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
         let progress_callback = self.progress_callback.take();
         let tries = self.tries;
         let urls = &self.urls;
+        let headers = &self.headers;
 
         let tempdir;
         let cache_path = match self.cache_path {
@@ -292,7 +301,8 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
                             let url = urls[((part as usize) + tried as usize) % urls.len()];
                             let result = attempt_get(
                                 client.clone(), &mut part_file, url, &progress,
-                                &local, length, range, has_callback
+                                &local, length, range, has_callback,
+                                headers.clone()
                             );
 
                             match result {
@@ -358,6 +368,7 @@ fn attempt_get(
     length: u64,
     range: Option<(u64, u64)>,
     has_callback: bool,
+    headers: Option<Arc<Vec<[String; 2]>>>
 ) -> io::Result<()> {
     if has_callback {
         let mut writer = ProgressWriter::new(part, |written| {
@@ -365,9 +376,9 @@ fn attempt_get(
             local.fetch_add(written, Ordering::SeqCst);
         });
 
-        send_get_request(client, &mut writer, url, length, range)?;
+        send_get_request(client, &mut writer, url, length, range, headers)?;
     } else {
-        send_get_request(client, part, url, length, range)?;
+        send_get_request(client, part, url, length, range, headers)?;
     }
 
     Ok(())
@@ -378,12 +389,19 @@ fn send_get_request(
     writer: &mut impl Write,
     url: &str,
     length: u64,
-    range: Option<(u64, u64)>
+    range: Option<(u64, u64)>,
+    headers: Option<Arc<Vec<[String; 2]>>>
 ) -> io::Result<u64> {
     let mut client = client.get(url);
 
     if let Some((from, to)) = range {
         client = client.header(RANGE, range_string(from, to).as_str());
+    }
+
+    if let Some(headers) = headers {
+        for h in &*headers {
+            client = client.header(h[0].as_str(), h[1].as_str());
+        }
     }
 
     let mut response = client.send()
