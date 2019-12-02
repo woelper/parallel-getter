@@ -56,7 +56,7 @@ use std::{fs, thread};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 trait PartWriter: Send + Seek + Read + Write {}
@@ -111,7 +111,7 @@ pub struct ParallelGetter<'a, W: Write + 'a> {
     threshold_memory: Option<u64>,
     tries: u32,
     cache_path: Option<PathBuf>,
-    progress_callback: Option<(Box<Fn(u64, u64)>, u64)>,
+    progress_callback: Option<(Box<dyn Fn(u64, u64) -> bool>, u64)>,
     headers: Option<Arc<Vec<[String; 2]>>>,
 }
 
@@ -176,8 +176,8 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
     }
 
     /// Specify a callback for monitoring progress, to be polled at the given interval.
-    pub fn callback(mut self, poll_ms: u64, func: Box<Fn(u64, u64)>) -> Self {
-        self.progress_callback = Some((func, poll_ms));
+    pub fn callback<F: Fn(u64, u64) -> bool + 'static>(mut self, poll_ms: u64, func: F) -> Self {
+        self.progress_callback = Some((Box::new(func), poll_ms));
         self
     }
 
@@ -286,6 +286,7 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
 
         let result: io::Result<()> = {
             let progress = progress.clone();
+            let cancel = Arc::new(AtomicBool::new(false));
             crossbeam::scope(move |scope| {
                 let mut threads = Vec::new();
                 for (part, mut part_file) in (0u64..nthreads).zip(parts.into_iter()) {
@@ -294,12 +295,14 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
 
                     let local_progress = Arc::new(AtomicUsize::new(0));
                     let local = local_progress.clone();
+                    let cancel = cancel.clone();
                     let handle: ScopedJoinHandle<io::Result<_>> = scope.spawn(move || {
                         let range = calc_range(length, nthreads, part);
 
                         for tried in 0..tries {
                             let url = urls[((part as usize) + tried as usize) % urls.len()];
                             let result = attempt_get(
+                                &cancel,
                                 client.clone(), &mut part_file, url, &progress,
                                 &local, length, range, has_callback,
                                 headers.clone()
@@ -308,6 +311,10 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
                             match result {
                                 Ok(()) => break,
                                 Err(why) => {
+                                    if cancel.load(Ordering::SeqCst) {
+                                        return Err(why);
+                                    }
+
                                     progress.fetch_sub(local.load(Ordering::SeqCst), Ordering::SeqCst);
                                     local.store(0, Ordering::SeqCst);
                                     part_file.seek(SeekFrom::Start(0))?;
@@ -327,6 +334,7 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
                 }
 
                 if let Some((ref progress_callback, mut poll_ms)) = progress_callback {
+                    
                     // Poll for progress until all background threads have exited.
                     poll_ms = if poll_ms == 0 { 1 } else { poll_ms };
                     let poll_ms = Duration::from_millis(poll_ms);
@@ -335,7 +343,13 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
                     while Arc::strong_count(&progress) != 1 {
                         let progress = progress.load(Ordering::SeqCst) as u64;
                         if time_since_update.elapsed() > poll_ms {
-                            progress_callback(progress, length);
+                            if progress_callback(progress, length) {
+                                cancel.store(true, Ordering::SeqCst);
+                                return Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    "download cancelled"
+                                ));
+                            }
                             time_since_update = Instant::now();
                         }
 
@@ -360,6 +374,7 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
 }
 
 fn attempt_get(
+    cancel: &Arc<AtomicBool>,
     client: Arc<Client>,
     part: &mut Box<dyn PartWriter>,
     url: &str,
@@ -371,10 +386,10 @@ fn attempt_get(
     headers: Option<Arc<Vec<[String; 2]>>>
 ) -> io::Result<()> {
     if has_callback {
-        let mut writer = ProgressWriter::new(part, |written| {
+        let mut writer = WriteCancel::new(cancel.clone(), ProgressWriter::new(part, |written| {
             progress.fetch_add(written, Ordering::SeqCst);
             local.fetch_add(written, Ordering::SeqCst);
-        });
+        }));
 
         send_get_request(client, &mut writer, url, length, range, headers)?;
     } else {
@@ -475,4 +490,32 @@ fn hash(string: &str) -> String {
     let mut hasher = DefaultHasher::new();
     string.hash(&mut hasher);
     format!("{:x}", hasher.finish())
+}
+
+struct WriteCancel<W> {
+    cancel: Arc<AtomicBool>,
+    writer: W,
+}
+
+impl<W: Write> WriteCancel<W> {
+    pub fn new(cancel: Arc<AtomicBool>, writer: W) -> Self {
+        Self { cancel, writer }
+    }
+}
+
+impl<W: Write> Write for WriteCancel<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "write cancelled"
+            ))
+        }
+
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
 }
