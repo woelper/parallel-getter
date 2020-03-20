@@ -46,7 +46,8 @@ mod range;
 use crossbeam::thread::ScopedJoinHandle;
 use numtoa::NumToA;
 use progress_streams::ProgressWriter;
-use reqwest::{Client, StatusCode, header::{
+use reqwest::blocking::Client;
+use reqwest::{StatusCode, header::{
     CONTENT_LENGTH,
     CONTENT_RANGE,
     RANGE,
