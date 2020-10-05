@@ -59,6 +59,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use std::io::{Error, ErrorKind};
 
 trait PartWriter: Send + Seek + Read + Write {}
 impl<T: Send + Seek + Read + Write> PartWriter for T {}
@@ -290,6 +291,8 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
             let cancel = Arc::new(AtomicBool::new(false));
             crossbeam::scope(move |scope| {
                 let mut threads = Vec::new();
+
+
                 for (part, mut part_file) in (0u64..nthreads).zip(parts.into_iter()) {
                     let client = client.clone();
                     let progress = progress.clone();
@@ -297,7 +300,7 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
                     let local_progress = Arc::new(AtomicUsize::new(0));
                     let local = local_progress.clone();
                     let cancel = cancel.clone();
-                    let handle: ScopedJoinHandle<io::Result<_>> = scope.spawn(move || {
+                    let handle: ScopedJoinHandle<io::Result<_>> = scope.spawn(move |_| {
                         let range = calc_range(length, nthreads, part);
 
                         for tried in 0..tries {
@@ -365,7 +368,11 @@ impl<'a, W: Write> ParallelGetter<'a, W> {
                 }
 
                 Ok(())
+                
             })
+            .map_err(|e| Error::new(ErrorKind::Other, "Error occurred"))
+            .map(|x| ())
+            //Ok(())
         };
 
         result?;

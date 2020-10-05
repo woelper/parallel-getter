@@ -10,9 +10,9 @@ keywords = ["parallel", "download", "get"]
 categories = ["network-programming"]
 
 [dependencies]
-progress-streams = "1.0.0"
-reqwest = { version = "0.10.4", features = ["blocking"] }
+progress-streams = "1.1.0"
+reqwest = { version = "0.10.8", features = ["blocking"] }
 
-tempfile = "3.0.4"
+tempfile = "3.1.0"
 numtoa = "0.2.3"
-crossbeam = "0.4.1"
+crossbeam = "0.7.3"
